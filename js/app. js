@@ -1,0 +1,185 @@
+// js/app.js (module)
+import { firebaseConfig } from "./firebase-config.js";
+import { initializeApp } from "https://www.gstatic.com/firebasejs/11.9.0/firebase-app.js";
+import { getAuth, signInAnonymously, onAuthStateChanged, setPersistence, browserLocalPersistence } from "https://www.gstatic.com/firebasejs/11.9.0/firebase-auth.js";
+import {
+  getFirestore, collection, addDoc, doc, setDoc, onSnapshot, query, orderBy,
+  serverTimestamp, updateDoc
+} from "https://www.gstatic.com/firebasejs/11.9.0/firebase-firestore.js";
+import { getStorage, ref as sRef, uploadBytes, getDownloadURL } from "https://www.gstatic.com/firebasejs/11.9.0/firebase-storage.js";
+
+// init
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = getFirestore(app);
+const storage = getStorage(app);
+
+// try set persistence so login sticks
+setPersistence(auth, browserLocalPersistence).catch(()=>{/*ignore*/});
+
+// UI refs
+const userArea = document.getElementById('userArea');
+const threadsList = document.getElementById('threadsList');
+const chatHeader = document.getElementById('chatHeader');
+const messagesEl = document.getElementById('messages');
+const txtInput = document.getElementById('txtInput');
+const sendBtn = document.getElementById('sendBtn');
+const btnNewChat = document.getElementById('btnNewChat');
+const btnNewGroup = document.getElementById('btnNewGroup');
+const modal = document.getElementById('modal');
+const modalTitle = document.getElementById('modalTitle');
+const modalBody = document.getElementById('modalBody');
+const modalCancel = document.getElementById('modalCancel');
+const modalOk = document.getElementById('modalOk');
+const imageInput = document.getElementById('imageInput');
+const imgBtn = document.getElementById('imgBtn');
+
+let me = null;
+let currentThread = null;
+let unsubMessages = null;
+
+// AUTH + one-time username flow
+onAuthStateChanged(auth, async user => {
+  if (!user) {
+    try { await signInAnonymously(auth); return; } catch(e){ console.error(e); return; }
+  }
+  me = { uid: user.uid };
+  const stored = localStorage.getItem('am_profile');
+  if (stored) {
+    me = { ...me, ...JSON.parse(stored) };
+    showUser();
+    startListing();
+  } else {
+    askUsername();
+  }
+});
+
+function showUser(){
+  userArea.innerHTML = `<div style="text-align:right;font-size:14px">
+    <div style="font-weight:700">${escapeHtml(me.username||('User-'+me.uid.slice(0,6)))}</div>
+    <div style="font-size:12px;color:var(--muted)">${me.uid.slice(0,6)}</div>
+  </div>`;
+}
+
+function askUsername(){
+  openModal('Choose a username', `
+    <input id="tmpName" placeholder="choose a username" style="width:100%;padding:10px;border-radius:8px;background:var(--panel);border:1px solid rgba(255,255,255,0.03);color:var(--accent-2)"/>
+    <div style="margin-top:8px;font-size:12px;color:var(--muted)">This is one-time. You can edit later in settings.</div>
+  `, async () => {
+    const name = document.getElementById('tmpName').value.trim();
+    if (!name) return alert('Please enter a username');
+    me.username = name;
+    localStorage.setItem('am_profile', JSON.stringify(me));
+    await setDoc(doc(db,'users',me.uid), { uid:me.uid, username:me.username, lastSeen: serverTimestamp() }, { merge:true });
+    closeModal();
+    showUser();
+    startListing();
+  }, true);
+}
+
+// LIST THREADS (threads collection sorted by lastTime)
+function startListing(){
+  const q = query(collection(db,'threads'), orderBy('lastTime','desc'));
+  onSnapshot(q, snap => {
+    threadsList.innerHTML = '';
+    snap.forEach(dsnap => {
+      const d = dsnap.data();
+      const id = dsnap.id;
+      const members = d.members || [];
+      if (!members.includes(me.uid)) return; // only show threads where user is member
+      const isGroup = d.type === 'group';
+      const title = isGroup ? (d.name || 'Group') : (d.displayNames && d.displayNames[me.uid]) ? d.displayNames[me.uid] : (members.filter(m=>m!==me.uid)[0] || 'Chat');
+      const el = document.createElement('div');
+      el.className = 'thread';
+      el.innerHTML = `<div class="avatar">${isGroup ? 'G' : (title[0]||'?')}</div>
+        <div class="meta"><div class="name">${escapeHtml(title)}</div><div class="last">${escapeHtml(d.lastMsg||'')}</div></div>`;
+      el.onclick = ()=> openThread(id, isGroup, d);
+      threadsList.appendChild(el);
+    });
+  });
+}
+
+// OPEN A THREAD (listen messages)
+async function openThread(id, isGroup, meta){
+  if (unsubMessages) unsubMessages();
+  currentThread = { id, isGroup };
+  chatHeader.textContent = isGroup ? (meta.name || 'Group') : (meta.displayNames ? meta.displayNames[me.uid] : 'Chat');
+  messagesEl.innerHTML = '';
+  const colPath = isGroup ? `groups/${id}/messages` : `threads/${id}/messages`;
+  const q = query(collection(db, colPath), orderBy('createdAt','desc'));
+  unsubMessages = onSnapshot(q, snap => {
+    messagesEl.innerHTML = '';
+    snap.forEach(docSnap=>{
+      const m = docSnap.data();
+      const isMe = m.senderId === me.uid;
+      const bubble = document.createElement('div');
+      bubble.className = 'msg ' + (isMe ? 'me' : 'other');
+      if (m.type === 'image' && m.imageUrl){
+        bubble.innerHTML = `<div><img src="${m.imageUrl}" style="max-width:240px;border-radius:8px"/></div><div class="meta">${escapeHtml(m.senderName||'') } • ${new Date(m.createdAt?.toMillis?.()||Date.now()).toLocaleTimeString()}</div>`;
+      } else {
+        bubble.innerHTML = `<div>${escapeHtml(m.text||'')}</div><div class="meta">${escapeHtml(m.senderName||'') } • ${new Date(m.createdAt?.toMillis?.()||Date.now()).toLocaleTimeString()}</div>`;
+      }
+      messagesEl.appendChild(bubble);
+    });
+  });
+}
+
+// NEW CHAT
+btnNewChat.onclick = ()=> openModal('Start new chat', `<input id="chatPhone" placeholder="Enter other user UID (or username for demo)" style="width:100%;padding:10px;border-radius:8px;background:var(--panel);border:1px solid rgba(255,255,255,0.03);color:var(--accent-2)"/><div style="margin-top:6px;color:var(--muted);font-size:13px">Type the UID (from other user) or invite them to register.</div>`, async ()=> {
+  const v = document.getElementById('chatPhone').value.trim(); if(!v) return alert('enter id');
+  const otherUid = v;
+  const members = [me.uid, otherUid].sort();
+  const threadId = members.join('_');
+  await setDoc(doc(db,'threads',threadId), { members: members, type: 'dm', lastMsg:'', lastTime: serverTimestamp(), displayNames: { [me.uid]: me.username } }, { merge:true });
+  closeModal();
+  openThread(threadId,false,{ displayNames: { [me.uid]: me.username }});
+}, true);
+
+// NEW GROUP
+btnNewGroup.onclick = ()=> openModal('Create group', `<input id="groupName" placeholder="Group name" style="width:100%;padding:10px;border-radius:8px;background:var(--panel);border:1px solid rgba(255,255,255,0.03);color:var(--accent-2)"/><textarea id="groupMembers" placeholder="Add member UIDs (comma separated)" style="width:100%;margin-top:8px;padding:10px;border-radius:8px;background:var(--panel);height:80px;color:var(--accent-2)"></textarea>`, async ()=> {
+  const name = document.getElementById('groupName').value.trim();
+  let members = (document.getElementById('groupMembers').value||'').split(',').map(x=>x.trim()).filter(Boolean);
+  if (!name || members.length===0) return alert('Provide name and at least one member UID');
+  members.push(me.uid); members = Array.from(new Set(members));
+  const id = 'group_' + Math.random().toString(36).slice(2,9);
+  await setDoc(doc(db,'groups',id), { name, members, admins: [me.uid], lastMsg:'', lastTime: serverTimestamp() });
+  closeModal();
+  openThread(id,true,{ name });
+}, true);
+
+// SEND MESSAGE
+sendBtn.onclick = async ()=>{
+  const text = txtInput.value.trim();
+  if (!text && !imageInput.files.length) return;
+  if (!currentThread) return alert('Select a chat first');
+  const payload = { senderId: me.uid, senderName: me.username, text: text || '', type: imageInput.files.length ? 'image' : 'text', createdAt: serverTimestamp() };
+
+  if (imageInput.files.length){
+    const file = imageInput.files[0];
+    const path = currentThread.isGroup ? `groups/${currentThread.id}/images/${Date.now()}_${file.name}` : `threads/${currentThread.id}/images/${Date.now()}_${file.name}`;
+    const r = sRef(storage, path);
+    const ab = await file.arrayBuffer();
+    await uploadBytes(r, new Uint8Array(ab));
+    const url = await getDownloadURL(r);
+    payload.imageUrl = url;
+  }
+
+  const container = currentThread.isGroup ? collection(db,`groups/${currentThread.id}/messages`) : collection(db,`threads/${currentThread.id}/messages`);
+  await addDoc(container, payload);
+  const docRef = currentThread.isGroup ? doc(db,'groups',currentThread.id) : doc(db,'threads',currentThread.id);
+  await updateDoc(docRef, { lastMsg: payload.type === 'text' ? payload.text : '[Image]', lastTime: serverTimestamp() }).catch(()=>{});
+  txtInput.value = ''; imageInput.value = '';
+};
+
+imgBtn.onclick = ()=> imageInput.click();
+
+// modal helpers
+function openModal(title, innerHtml, onOk, showOk=true){
+  modalTitle.textContent = title; modalBody.innerHTML = innerHtml; modal.classList.remove('hidden');
+  modalOk.onclick = ()=> onOk && onOk(); modalCancel.onclick = ()=> closeModal();
+  modalOk.style.display = showOk ? 'inline-block' : 'none';
+}
+function closeModal(){ modal.classList.add('hidden'); modalBody.innerHTML=''; }
+
+// small util
+function escapeHtml(s){ if(!s) return ''; return String(s).replace(/[&<>"']/g, c=>({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' })[c]); }
